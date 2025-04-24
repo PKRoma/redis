@@ -122,6 +122,7 @@
 
 static RedisModuleType *VectorSetType;
 static uint64_t VectorSetTypeNextId = 0;
+static atomic_int VectorSetsActiveThreads = 0;
 
 // Default EF value if not specified during creation.
 #define VSET_DEFAULT_C_EF 200
@@ -131,6 +132,17 @@ static uint64_t VectorSetTypeNextId = 0;
 
 // Default num elements returned by VSIM.
 #define VSET_DEFAULT_COUNT 10
+
+// Default max number of threaded requests spawned at the same time. Note that
+// it does not mean that this number of HNSW requests are really happening
+// in parallel, this is up to HNSW_MAX_THREADS, however threaded requests
+// that are in excess of HNSW_MAX_THREADS will not run but will also NOT block
+// the server on the command.
+//
+// When the specified number of threaded requests is reached, we use
+// synchronous execution of VADD/VSIM (blocking, on the main thread).
+// Setting it to 0 will force all the requests to be handled synchronously.
+#define VSET_MAX_THREADED_REQUESTS 256
 
 /* ========================== Internal data structure  ====================== */
 
@@ -472,6 +484,7 @@ void *VADD_thread(void *arg) {
     pthread_rwlock_unlock(&vset->in_use_lock);
     RedisModule_BlockedClientMeasureTimeEnd(bc);
     RedisModule_UnblockClient(bc,targ); // Use targ as privdata.
+    VectorSetsActiveThreads--;
     return NULL;
 }
 
@@ -626,11 +639,15 @@ int VADD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
      * the master, while with CAS the timing would be different.
      *
      * Also for Lua scripts and MULTI/EXEC, we want to run the command
-     * on the main thread. */
-    if (RedisModule_GetContextFlags(ctx) &
+     * on the main thread.
+     *
+     * Finally, we run the command synchronously in case we already have
+     * the maximum number of threads running. */
+    if ((RedisModule_GetContextFlags(ctx) &
             (REDISMODULE_CTX_FLAGS_REPLICATED|
              REDISMODULE_CTX_FLAGS_LUA|
-             REDISMODULE_CTX_FLAGS_MULTI))
+             REDISMODULE_CTX_FLAGS_MULTI)) ||
+        VectorSetsActiveThreads >= VSET_MAX_THREADED_REQUESTS)
     {
         cas = 0;
     }
@@ -759,8 +776,10 @@ int VADD_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         if (attrib) RedisModule_RetainString(ctx,attrib);
         RedisModule_BlockedClientMeasureTimeStart(bc);
         vset->thread_creation_pending++;
+        VectorSetsActiveThreads++;
         if (pthread_create(&tid,NULL,VADD_thread,targ) != 0) {
             vset->thread_creation_pending--;
+            VectorSetsActiveThreads--;
             RedisModule_AbortBlock(bc);
             RedisModule_Free(targ);
             RedisModule_FreeString(ctx,val);
@@ -881,13 +900,15 @@ void *VSIM_thread(void *arg) {
     exprstate *filter_expr = targ[7];
     unsigned long filter_ef = (unsigned long)targ[8];
     unsigned long ground_truth = (unsigned long)targ[9];
-    RedisModule_Free(targ[4]);
-    RedisModule_Free(targ);
 
     /* Lock the object and signal that we are no longer pending
      * the lock acquisition. */
     RedisModule_Assert(pthread_rwlock_rdlock(&vset->in_use_lock) == 0);
     vset->thread_creation_pending--;
+
+    // Free passed arguments allocations.
+    RedisModule_Free(targ[4]);
+    RedisModule_Free(targ);
 
     // Accumulate reply in a thread safe context: no contention.
     RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bc);
@@ -900,6 +921,7 @@ void *VSIM_thread(void *arg) {
     RedisModule_FreeThreadSafeContext(ctx);
     RedisModule_BlockedClientMeasureTimeEnd(bc);
     RedisModule_UnblockClient(bc,NULL);
+    VectorSetsActiveThreads--;
     return NULL;
 }
 
@@ -1079,10 +1101,13 @@ int VSIM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (filter_ef == 0) filter_ef = count * 100; // Max filter visited nodes.
 
     /* Disable threaded for MULTI/EXEC and Lua, or if explicitly
-     * requested by the user via the NOTHREAD option. */
-    if (no_thread || (RedisModule_GetContextFlags(ctx) &
-                      (REDISMODULE_CTX_FLAGS_LUA|
-                       REDISMODULE_CTX_FLAGS_MULTI)))
+     * requested by the user via the NOTHREAD option, and if we have
+     * too many threads already. */
+    if (no_thread ||
+        VectorSetsActiveThreads >= VSET_MAX_THREADED_REQUESTS ||
+        (RedisModule_GetContextFlags(ctx) &
+         (REDISMODULE_CTX_FLAGS_LUA|
+          REDISMODULE_CTX_FLAGS_MULTI)))
     {
         threaded_request = 0;
     }
@@ -1110,8 +1135,10 @@ int VSIM_RedisCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         targ[9] = (void*)(unsigned long)ground_truth;
         RedisModule_BlockedClientMeasureTimeStart(bc);
         vset->thread_creation_pending++;
+        VectorSetsActiveThreads++;
         if (pthread_create(&tid,NULL,VSIM_thread,targ) != 0) {
             vset->thread_creation_pending--;
+            VectorSetsActiveThreads--;
             RedisModule_AbortBlock(bc);
             RedisModule_Free(targ[4]);
             RedisModule_Free(targ);
